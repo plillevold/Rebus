@@ -1,5 +1,5 @@
 <SolutionConfiguration>
-  <FileVersion>0</FileVersion>
+  <FileVersion>1</FileVersion>
   <AutoEnableOnStartup>False</AutoEnableOnStartup>
   <AllowParallelTestExecution>false</AllowParallelTestExecution>
   <AllowTestsToRunInParallelWithThemselves>true</AllowTestsToRunInParallelWithThemselves>
@@ -7,7 +7,7 @@
   <FrameworkUtilisationTypeForGallio>UseStaticAnalysis</FrameworkUtilisationTypeForGallio>
   <FrameworkUtilisationTypeForMSpec>UseStaticAnalysis</FrameworkUtilisationTypeForMSpec>
   <FrameworkUtilisationTypeForMSTest>UseStaticAnalysis</FrameworkUtilisationTypeForMSTest>
-  <EngineModes>Run all tests automatically:BFRydWU=;Run all tests manually:BUZhbHNl;Run impacted tests automatically, others manually (experimental!):CklzSW1wYWN0ZWQ=;Run pinned tests automatically, others manually:CElzUGlubmVk</EngineModes>
+  <EngineModes>Run all tests automatically:BFRydWU=;Run all tests manually:BUZhbHNl;Run impacted tests automatically, others manually (experimental!):CklzSW1wYWN0ZWQ=;Run pinned tests automatically, others manually:CElzUGlubmVk;Run all tests except Integration stuff:DlN0cnVjdHVyYWxOb2RlAgAAABNEb2VzTm90SGF2ZUNhdGVnb3J5BUF6dXJlGUZ1bGxOYW1lRG9lc05vdE1hdGNoUmVnZXgGKk1zbXEqAAAAAA==</EngineModes>
   <MetricsExclusionList>
 </MetricsExclusionList>
 </SolutionConfiguration>

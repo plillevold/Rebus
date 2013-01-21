@@ -5,6 +5,9 @@ deploy/*
 packages
 packages/*
 _ReSharper.*
+_NCrunch_*
+*.ncrunchproject
+*.ncrunchsolution
 *.csproj.user
 *.resharper.user
 *.ReSharper.user
