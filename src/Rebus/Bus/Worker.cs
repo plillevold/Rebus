@@ -360,7 +360,7 @@ namespace Rebus.Bus
         {
             var transactionOptions = new TransactionOptions
             {
-                IsolationLevel = IsolationLevel.ReadCommitted,
+                IsolationLevel = IsolationLevel.Snapshot,
                 Timeout = TransactionManager.DefaultTimeout
             };
             return new TransactionScope(TransactionScopeOption.Required, transactionOptions);
