@@ -9,9 +9,9 @@ namespace Rebus.Autofac
 {
     public class AutofacContainerAdapter : IContainerAdapter
     {
-        readonly IContainer container;
+        readonly ILifetimeScope container;
 
-        public AutofacContainerAdapter(IContainer container)
+        public AutofacContainerAdapter(ILifetimeScope container)
         {
             if (container == null)
             {
@@ -37,9 +37,9 @@ namespace Rebus.Autofac
         public void SaveBusInstances(IBus bus)
         {
             var builder = new ContainerBuilder();
-            builder.RegisterInstance(bus).As<IBus>();
+            builder.RegisterInstance(bus).As<IBus>().PreserveExistingDefaults();
             builder.Register(a => MessageContext.GetCurrent()).InstancePerDependency();
-            builder.Update(container);
+            builder.Update(container.ComponentRegistry);
         }
     }
 }
