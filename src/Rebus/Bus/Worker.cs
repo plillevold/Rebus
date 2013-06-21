@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Reflection;
 using System.Threading;
 using System.Transactions;
+using Rebus.Configuration;
 using Rebus.Logging;
 using System.Linq;
 using Rebus.Timeout;
@@ -32,6 +34,8 @@ namespace Rebus.Bus
         readonly IReceiveMessages receiveMessages;
         readonly ISerializeMessages serializeMessages;
         readonly IMutateIncomingMessages mutateIncomingMessages;
+        readonly IEnumerable<IUnitOfWorkManager> unitOfWorkManagers;
+        readonly ConfigureAdditionalBehavior configureAdditionalBehavior;
 
         internal event Action<ReceivedTransportMessage> BeforeTransportMessage = delegate { };
 
@@ -60,11 +64,15 @@ namespace Rebus.Bus
             string workerThreadName,
             IHandleDeferredMessage handleDeferredMessage,
             IMutateIncomingMessages mutateIncomingMessages,
-            IStoreTimeouts storeTimeouts)
+            IStoreTimeouts storeTimeouts,
+            IEnumerable<IUnitOfWorkManager> unitOfWorkManagers,
+            ConfigureAdditionalBehavior configureAdditionalBehavior)
         {
             this.receiveMessages = receiveMessages;
             this.serializeMessages = serializeMessages;
             this.mutateIncomingMessages = mutateIncomingMessages;
+            this.unitOfWorkManagers = unitOfWorkManagers;
+            this.configureAdditionalBehavior = configureAdditionalBehavior;
             this.errorTracker = errorTracker;
             dispatcher = new Dispatcher(storeSagaData, activateHandlers, storeSubscriptions, inspectHandlerPipeline, handleDeferredMessage, storeTimeouts);
             dispatcher.UncorrelatedMessage += RaiseUncorrelatedMessage;
@@ -155,6 +163,8 @@ namespace Rebus.Bus
                 }
                 catch (Exception e)
                 {
+                    try
+                    {
                     // if there's two levels of TargetInvocationExceptions, it's user code that threw...
                     if (e is TargetInvocationException && e.InnerException is TargetInvocationException)
                     {
@@ -167,6 +177,15 @@ namespace Rebus.Bus
                     else
                     {
                         SystemException(this, e);
+                    }
+                }
+                    catch (Exception ex)
+                    {
+                        log.Error(ex, "An exception occurred while raising an error event! There's nothing we can do about" +
+                                     " it at this point, except kick back and wait for a while, because we probably don't" +
+                                     " want to spam the logs - so we'll sleep for a second before carrying on...");
+
+                        Thread.Sleep(TimeSpan.FromSeconds(1));
                     }
                 }
             }
@@ -246,6 +265,12 @@ namespace Rebus.Bus
                     context = MessageContext.Establish(message.Headers);
                     MessageContextEstablished(context);
 
+                    var unitsOfWork = unitOfWorkManagers.Select(u => u.Create())
+                                    .Where(u => !ReferenceEquals(null, u))
+                                    .ToArray(); //< remember to invoke the chain here :)
+
+                    try
+                    {
                     foreach (var logicalMessage in message.Messages.Select(MutateIncoming))
                     {
                         context.SetLogicalMessage(logicalMessage);
@@ -259,7 +284,8 @@ namespace Rebus.Bus
 
                             log.Debug("Dispatching message {0}: {1}", id, typeToDispatch);
 
-                            GetDispatchMethod(typeToDispatch).Invoke(this, new[] { logicalMessage });
+                                GetDispatchMethod(typeToDispatch)
+                                    .Invoke(this, new[] {logicalMessage});
                         }
                         catch (Exception exception)
                         {
@@ -293,8 +319,40 @@ namespace Rebus.Bus
                         }
                     }
 
+                        foreach (var unitOfWork in unitsOfWork)
+                        {
+                            unitOfWork.Commit();
+                        }
+                    }
+                    catch
+                    {
+                        foreach (var unitOfWork in unitsOfWork)
+                        {
+                            try
+                            {
+                                unitOfWork.Abort();
+                            }
+                            catch (Exception abortException)
+                            {
+                                log.Warn("An error occurred while aborting the unit of work {0}: {1}",
+                                         unitOfWork, abortException);
+                            }
+                        }
+                        throw;
+                    }
+                    finally
+                    {
+                        foreach (var unitOfWork in unitsOfWork)
+                        {
+                            unitOfWork.Dispose();
+                        }
+                    }
+
+                    if (scope != null)
+                    {
                     scope.Complete();
                 }
+            }
             }
             catch (Exception exception)
             {
@@ -338,8 +396,8 @@ namespace Rebus.Bus
 
         void HandlePoisonMessage(string id, ReceivedTransportMessage transportMessage)
         {
-            log.Error("Handling message {0} has failed the maximum number of times", id);
             var errorText = errorTracker.GetErrorText(id);
+            log.Error("Handling message {0} has failed the maximum number of times - details: {1}", id, errorText);
             var poisonMessageInfo = errorTracker.GetPoisonMessageInfo(id);
 
             MessageFailedMaxNumberOfTimes(transportMessage, errorText);
@@ -358,6 +416,11 @@ namespace Rebus.Bus
 
         TransactionScope BeginTransaction()
         {
+            if (!configureAdditionalBehavior.HandleMessagesInTransactionScope)
+            {
+                return null;
+            }
+
             var transactionOptions = new TransactionOptions
             {
                 IsolationLevel = IsolationLevel.Snapshot,

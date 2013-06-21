@@ -1,5 +1,4 @@
 using System;
-using Ponder;
 using Rebus.Bus;
 using Rebus.Logging;
 using Rebus.Messages;
@@ -107,6 +106,15 @@ namespace Rebus.Configuration
             return this;
         }
 
+        /// <summary>
+        /// Invokes the configurer that allows for customizing various behavioral aspects
+        /// </summary>
+        public RebusConfigurer Behavior(Action<RebusBehaviorConfigurer> configureBehavior)
+        {
+            configureBehavior(new RebusBehaviorConfigurer(Backbone));
+            return this;
+        }
+
         void AssertIsNull(object serviceReference, string configurationThingie)
         {
             if (serviceReference == null) return;
@@ -144,7 +152,7 @@ namespace Rebus.Configuration
             var bus = new RebusBus(Backbone.ActivateHandlers, Backbone.SendMessages, Backbone.ReceiveMessages,
                                    Backbone.StoreSubscriptions, Backbone.StoreSagaData, Backbone.DetermineMessageOwnership,
                                    Backbone.SerializeMessages, Backbone.InspectHandlerPipeline, Backbone.ErrorTracker,
-                                   Backbone.StoreTimeouts);
+                                   Backbone.StoreTimeouts, Backbone.AdditionalBehavior);
 
             Backbone.TransferEvents(bus);
 

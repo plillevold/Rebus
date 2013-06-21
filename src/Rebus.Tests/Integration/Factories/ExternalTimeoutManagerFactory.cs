@@ -1,4 +1,6 @@
-﻿using Rebus.Persistence.InMemory;
+﻿using System;
+using Rebus.Persistence.InMemory;
+using Rebus.Shared;
 using Rebus.Timeout;
 
 namespace Rebus.Tests.Integration.Factories
@@ -10,7 +12,14 @@ namespace Rebus.Tests.Integration.Factories
 
         public void Initialize(IBusFactory busFactoryToUse)
         {
-            timeoutService = new TimeoutService(new InMemoryTimeoutStorage());
+            Console.WriteLine("Purging {0}, just to be sure", TimeoutService.DefaultInputQueueName);
+            MsmqUtil.PurgeQueue(TimeoutService.DefaultInputQueueName);
+
+            //var sqlServerTimeoutStorage = new SqlServerTimeoutStorage(SqlServerFixtureBase.ConnectionString, "rebus_timeouts").EnsureTableIsCreated();
+            //var mongoDbTimeoutStorage = new MongoDbTimeoutStorage(MongoDbFixtureBase.ConnectionString, "timeouts");
+            var inMemoryTimeoutStorage = new InMemoryTimeoutStorage();
+
+            timeoutService = new TimeoutService(inMemoryTimeoutStorage);
             timeoutService.Start();
             busFactory = busFactoryToUse;
         }

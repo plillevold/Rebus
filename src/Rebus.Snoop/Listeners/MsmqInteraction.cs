@@ -5,6 +5,7 @@ using System.Linq;
 using System.Messaging;
 using System.Text;
 using System.Threading.Tasks;
+using System.Windows;
 using GalaSoft.MvvmLight.Messaging;
 using Newtonsoft.Json;
 using Rebus.Shared;
@@ -22,9 +23,120 @@ namespace Rebus.Snoop.Listeners
             Messenger.Default.Register(this, (ReloadQueuesRequested request) => LoadQueues(request.Machine));
             Messenger.Default.Register(this, (ReloadMessagesRequested request) => LoadMessages(request.Queue));
             Messenger.Default.Register(this, (MoveMessagesToSourceQueueRequested request) => MoveMessagesToSourceQueues(request.MessagesToMove));
+            Messenger.Default.Register(this, (MoveMessagesToQueueRequested request) => MoveMessagesToQueue(request.MessagesToMove, true));
+            Messenger.Default.Register(this, (CopyMessagesToQueueRequested request) => MoveMessagesToQueue(request.MessagesToMove, false));
             Messenger.Default.Register(this, (DeleteMessagesRequested request) => DeleteMessages(request.MessagesToMove));
             Messenger.Default.Register(this, (DownloadMessagesRequested request) => DownloadMessages(request.MessagesToDownload));
             Messenger.Default.Register(this, (UpdateMessageRequested request) => UpdateMessage(request.Message, request.Queue));
+            Messenger.Default.Register(this, (PurgeMessagesRequested request) => PurgeMessages(request.Queue));
+            Messenger.Default.Register(this, (DeleteQueueRequested request) => DeleteQueue(request.Queue));
+        }
+
+        void DeleteQueue(Queue queue)
+        {
+            var isOk = IsOkWithUser("This will DELETE the queue {0} completely - press OK to continue...",
+                                                         queue.QueueName);
+
+            if (!isOk)
+            {
+                return;
+            }
+
+            Task.Factory
+                .StartNew(() =>
+                    {
+                        try
+                        {
+                            MessageQueue.Delete(queue.QueuePath);
+
+                            return new
+                                       {
+                                           Success = true,
+                                           Notification = NotificationEvent.Success("Queue {0} was deleted", queue.QueueName)
+                                       };
+                        }
+                        catch (Exception e)
+                        {
+                            return new
+                                       {
+                                           Success = false,
+                                           Notification = NotificationEvent.Fail(e.ToString(),
+                                                                                 "Something went wrong while attempting to delete queue {0}",
+                                                                                 queue.QueueName),
+                                       };
+                        }
+                    })
+                .ContinueWith(r =>
+                    {
+                        var result = r.Result;
+
+                        Messenger.Default.Send(result.Notification);
+
+                        if (result.Success)
+                        {
+                            Messenger.Default.Send(new QueueDeleted(queue));
+                        }
+                    }, Context.UiThread);
+        }
+
+        void PurgeMessages(Queue queue)
+        {
+            var isOk = IsOkWithUser("This will delete all the messages from the queue {0} - press OK to continue...",
+                                                         queue.QueueName);
+
+            if (!isOk)
+            {
+                return;
+            }
+
+            Task.Factory
+                .StartNew(() =>
+                    {
+                        try
+                        {
+                            using (var msmqQueue = new MessageQueue(queue.QueuePath))
+                            {
+                                msmqQueue.Purge();
+                            }
+
+                            return new
+                                       {
+                                           Notification =
+                                               NotificationEvent.Success("Queue {0} was purged", queue.QueueName),
+                                           Success = true,
+                                       };
+                        }
+                        catch (Exception e)
+                        {
+                            return new
+                                       {
+                                           Notification = NotificationEvent.Fail(e.ToString(),
+                                                                                 "Something went wrong while attempting to purge queue {0}",
+                                                                                 queue.QueueName),
+                                           Success = false,
+                                       };
+                        }
+                    })
+                .ContinueWith(r =>
+                    {
+                        var result = r.Result;
+
+                        Messenger.Default.Send(result.Notification);
+
+                        if (result.Success)
+                        {
+                            Messenger.Default.Send(new QueuePurged(queue));
+                        }
+                    }, Context.UiThread);
+        }
+
+        static bool IsOkWithUser(string question, params object[] objs)
+        {
+            var text = string.Format(question, objs);
+
+            var messageBoxResult = MessageBox.Show(text, "Question", MessageBoxButton.OKCancel);
+
+            return messageBoxResult == MessageBoxResult.OK;
         }
 
         void UpdateMessage(Message message, Queue queueToReload)
@@ -49,7 +161,7 @@ namespace Rebus.Snoop.Listeners
                                 try
                                 {
                                     var msmqMessage = queue.ReceiveById(message.Id, transaction);
-                                    
+
                                     var newMsmqMessage =
                                         new System.Messaging.Message
                                             {
@@ -88,7 +200,7 @@ namespace Rebus.Snoop.Listeners
                         if (a.Exception != null)
                         {
                             Messenger.Default.Send(NotificationEvent.Fail(a.Exception.ToString(),
-                                                                          "Something went wrong while attempting to update message with ID {0}", 
+                                                                          "Something went wrong while attempting to update message with ID {0}",
                                                                           message.Id));
 
                             return;
@@ -238,7 +350,7 @@ Body:
                                   {
                                       try
                                       {
-                                          MoveMessage(message);
+                                          MoveMessageToSourceQueue(message);
                                           result.Moved.Add(message);
                                       }
                                       catch (Exception e)
@@ -265,6 +377,87 @@ Body:
                 .ContinueWith(t => Messenger.Default.Send(t.Result), Context.UiThread);
         }
 
+        void MoveMessagesToQueue(List<Message> messagesToMove, bool shouldMoveMessages)
+        {
+            Task.Factory
+                .StartNew(() => messagesToMove)
+                .ContinueWith(t =>
+                    {
+                        var promptMessage =
+                            string.Format("{0} {1} message(s) - please enter destination queue (e.g. 'someQueue@someMachine'): ",
+                                shouldMoveMessages ? "Moving" : "Copying", messagesToMove.Count);
+
+                        var destinationQueue = Prompt(promptMessage);
+
+                        return new
+                                   {
+                                       DestinationQueue = destinationQueue,
+                                       Messages = t.Result
+                                   };
+                    }, Context.UiThread)
+                .ContinueWith(t =>
+                    {
+                        var result = new
+                                         {
+                                             Moved = new List<Message>(),
+                                             Failed = new List<Tuple<Message, string>>(),
+                                             DestinationQueue = t.Result.DestinationQueue,
+                                         };
+
+                        if (string.IsNullOrEmpty(t.Result.DestinationQueue))
+                        {
+                            result.Failed.AddRange(t.Result.Messages.Select(m => Tuple.Create(m, "No destination queue entered")));
+                            return result;
+                        }
+
+                        foreach (var message in t.Result.Messages)
+                        {
+                            try
+                            {
+                                var leaveCopyInSourceQueue = !shouldMoveMessages;
+                                MoveMessage(message, t.Result.DestinationQueue, leaveCopyInSourceQueue);
+                                result.Moved.Add(message);
+                            }
+                            catch (Exception e)
+                            {
+                                result.Failed.Add(new Tuple<Message, string>(message, e.ToString()));
+                            }
+                        }
+
+                        return result;
+                    })
+                .ContinueWith(t =>
+                    {
+                        var result = t.Result;
+
+                        if (result.Failed.Any())
+                        {
+                            var details = string.Join(Environment.NewLine,
+                                                      result.Failed.Select(
+                                                          f => string.Format("Id {0}: {1}", f.Item1.Id, f.Item2)));
+
+                            return NotificationEvent.Fail(details,
+                                                          "{0} messages moved to {1} - {2} move operations failed",
+                                                          result.Moved.Count, result.DestinationQueue,
+                                                          result.Failed.Count);
+                        }
+
+                        return NotificationEvent.Success("{0} messages moved to {1}", result.Moved.Count,
+                                                         result.DestinationQueue);
+                    })
+                .ContinueWith(t => Messenger.Default.Send(t.Result), Context.UiThread);
+
+        }
+
+        string Prompt(string text)
+        {
+            var dialog = new PromptDialog { PromptText = text };
+
+            dialog.ShowDialog();
+
+            return dialog.ResultText;
+        }
+
         void DeleteMessage(Message message)
         {
             using (var queue = new MessageQueue(message.QueuePath))
@@ -287,10 +480,15 @@ Body:
             Messenger.Default.Send(new MessageDeleted(message));
         }
 
-        void MoveMessage(Message message)
+        void MoveMessageToSourceQueue(Message message)
+        {
+            MoveMessage(message, message.Headers[Headers.SourceQueue], false);
+        }
+
+        static void MoveMessage(Message message, string destinationQueueName, bool leaveCopyInSourceQueue)
         {
             var sourceQueuePath = message.QueuePath;
-            var destinationQueuePath = MsmqUtil.GetFullPath(message.Headers[Headers.SourceQueue]);
+            var destinationQueuePath = MsmqUtil.GetFullPath(destinationQueueName);
 
             using (var transaction = new MessageQueueTransaction())
             {
@@ -303,6 +501,11 @@ Body:
                     var msmqMessage = sourceQueue.ReceiveById(message.Id, transaction);
                     destinationQueue.Send(msmqMessage, transaction);
 
+                    if (leaveCopyInSourceQueue)
+                    {
+                        sourceQueue.Send(msmqMessage, transaction);
+                    }
+
                     transaction.Commit();
                 }
                 catch
@@ -312,7 +515,7 @@ Body:
                 }
             }
 
-            Messenger.Default.Send(new MessageMoved(message, sourceQueuePath, destinationQueuePath));
+            Messenger.Default.Send(new MessageMoved(message, sourceQueuePath, destinationQueuePath, leaveCopyInSourceQueue));
         }
 
         void LoadMessages(Queue queue)
@@ -490,27 +693,53 @@ Body:
         {
             Task.Factory
                 .StartNew(() =>
-                              {
-                                  var privateQueues = MessageQueue.GetPrivateQueuesByMachine(machine.MachineName);
+                    {
+                        var queues = MessageQueue
+                            .GetPrivateQueuesByMachine(machine.MachineName)
+                            .Concat(new[]
+                                        {
+                                            // don't add non-transactional dead letter queue - wouldn't be safe!
+                                            //new MessageQueue(string.Format(@"FormatName:DIRECT=OS:{0}\SYSTEM$;DeadLetter", machine.MachineName)),
 
-                                  return privateQueues;
-                              })
+                                            new MessageQueue(string.Format(@"FormatName:DIRECT=OS:{0}\SYSTEM$;DeadXact", machine.MachineName)),
+                                        })
+                            .ToArray();
+
+                        return queues;
+                    })
                 .ContinueWith(t =>
                                   {
                                       if (!t.IsFaulted)
                                       {
-                                          var queues = t.Result
-                                              .Select(queue => new Queue(queue));
+                                          try
+                                          {
+                                              var queues = t.Result
+                                                            .Select(queue =>
+                                                                {
+                                                                    try
+                                                                    {
+                                                                        return new Queue(queue);
+                                                                    }
+                                                                    catch (Exception e)
+                                                                    {
+                                                                        throw new ApplicationException(string.Format("An error occurred while loading message queue {0}", queue.Path), e);
+                                                                    }
+                                                                });
 
-                                          machine.SetQueues(queues);
+                                              machine.SetQueues(queues);
 
-                                          return NotificationEvent.Success("{0} queues loaded from {1}",
-                                                                       t.Result.Length,
-                                                                       machine.MachineName);
+                                              return NotificationEvent.Success("{0} queues loaded from {1}",
+                                                                               t.Result.Length,
+                                                                               machine.MachineName);
+                                          }
+                                          catch (Exception e)
+                                          {
+                                              return NotificationEvent.Fail(e.ToString(), "Could not load queues from {0}: {1}",
+                                                                           machine.MachineName, e.Message);
+                                          }
                                       }
 
-                                      var details = t.Exception.ToString();
-                                      return NotificationEvent.Fail(details, "Could not load queues from {0}: {1}",
+                                      return NotificationEvent.Fail(t.Exception.ToString(), "Could not load queues from {0}: {1}",
                                                                    machine.MachineName, t.Exception.Message);
                                   }, Context.UiThread)
                 .ContinueWith(t => Messenger.Default.Send(t.Result), Context.UiThread);

@@ -106,6 +106,16 @@ namespace Rebus.Tests.Testing
                 });
         }
 
+        [Test]
+        public void AddShouldAddToAvailableSagaData()
+        {
+            var someSagaData = new SomeSagaData { JustSomeText = Guid.NewGuid().ToString()};
+            
+            var fixture = new SagaFixture<SomeSagaData>(new SomeSaga()) {someSagaData};
+
+            fixture.OfType<SomeSagaData>().First().JustSomeText.ShouldBe(someSagaData.JustSomeText);
+        }
+
         public class CounterpartUpdater : Saga<CounterpartData>,
             IAmInitiatedBy<CounterpartCreated>,
             IAmInitiatedBy<CounterpartUpdated>
@@ -184,7 +194,7 @@ namespace Rebus.Tests.Testing
 
             // assert
             var availableSagaData = fixture.AvailableSagaData;
-            availableSagaData.Count.ShouldBe(1);
+            availableSagaData.Count().ShouldBe(1);
             var sagaDataClone = availableSagaData.Single(d => d.SagaDataId == 10);
             sagaDataClone.JustSomeText.ShouldBe(recognizableText);
         }
@@ -208,9 +218,39 @@ namespace Rebus.Tests.Testing
 
             // assert
             var availableSagaData = fixture.AvailableSagaData;
-            availableSagaData.Count.ShouldBe(2);
+            availableSagaData.Count().ShouldBe(2);
             availableSagaData.Single(d => d.SagaDataId == 10).ReceivedMessages.ShouldBe(2);
             availableSagaData.Single(d => d.SagaDataId == 12).ReceivedMessages.ShouldBe(3);
+        }
+
+        [Test]
+        public void GivesEasyAccessToTheMostRecentlyCorrelatedSagaData()
+        {
+            // arrange
+            var fixture = new SagaFixture<SomeSagaData>(new SomeSaga());
+
+            fixture.CreatedNewSagaData += (message, data) => Console.WriteLine("Created new saga data");
+            fixture.CorrelatedWithExistingSagaData += (message, data) => Console.WriteLine("Correlated with existing saga data");
+            fixture.CouldNotCorrelate += message => Console.WriteLine("Could not correlate");
+
+            // act
+            fixture.Handle(new SomeMessage { SagaDataId = 10 });
+            var data10Created = fixture.Data;
+
+            fixture.Handle(new SomeMessage { SagaDataId = 10 });
+            var data10Correlated = fixture.Data;
+
+            fixture.Handle(new SomeMessage { SagaDataId = 12 });
+            var data12Created = fixture.Data;
+
+            fixture.Handle(new SomeMessage { SagaDataId = 12 });
+            var data12Correlated = fixture.Data;
+
+            // assert
+            data10Created.SagaDataId.ShouldBe(10);
+            data10Correlated.SagaDataId.ShouldBe(10);
+            data12Created.SagaDataId.ShouldBe(12);
+            data12Correlated.SagaDataId.ShouldBe(12);
         }
 
         [Test]

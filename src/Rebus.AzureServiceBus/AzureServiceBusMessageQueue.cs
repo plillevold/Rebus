@@ -1,245 +1,336 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.IO;
-using System.Runtime.Serialization.Formatters.Binary;
+using System.Runtime.Serialization;
 using System.Threading;
-using Rebus.Logging;
+using System.Transactions;
 using Microsoft.ServiceBus;
 using Microsoft.ServiceBus.Messaging;
-using Rebus.Shared;
+using System.Linq;
+using Rebus.Logging;
 
 namespace Rebus.AzureServiceBus
 {
-    public class AzureServiceBusMessageQueue : ISendMessages, IReceiveMessages
+    public class AzureServiceBusMessageQueue : IDuplexTransport, IDisposable
     {
-        const string AzureServiceBusMessageQueueContextKey = "AzureServiceBusMessageQueueContextKey";
-
         static ILog log;
+
         static AzureServiceBusMessageQueue()
         {
             RebusLoggerFactory.Changed += f => log = f.GetCurrentClassLogger();
         }
 
-        readonly ThreadLocal<Queue<BrokeredMessage>> messagesReceived = new ThreadLocal<Queue<BrokeredMessage>>(() => new Queue<BrokeredMessage>());
-        readonly ThreadLocal<Queue<Tuple<string, BrokeredMessage>>> messagesToSend = new ThreadLocal<Queue<Tuple<string, BrokeredMessage>>>(() => new Queue<Tuple<string, BrokeredMessage>>());
-        readonly MessagingFactory messagingFactory;
+        const string TopicName = "Rebus";
+        const string LogicalQueuePropertyKey = "LogicalDestinationQueue";
+
         readonly NamespaceManager namespaceManager;
-        readonly QueueClient receiverQueueClient;
+        readonly TopicDescription topicDescription;
+        readonly TopicClient topicClient;
+        readonly SubscriptionClient subscriptionClient;
 
-        public AzureServiceBusMessageQueue(string connectionString, string inputQueueName, string errorQueueName)
+        bool disposed;
+
+        public AzureServiceBusMessageQueue(string connectionString, string inputQueue)
         {
-            if (connectionString == null) throw new ArgumentNullException("connectionString");
+            log.Info("Initializing Azure Service Bus transport with logical input queue '{0}'", inputQueue);
 
-            if (inputQueueName == null) throw new ArgumentNullException("inputQueueName");
-            if (errorQueueName == null) throw new ArgumentNullException("errorQueueName");
-            inputQueueName = inputQueueName.ToLowerInvariant();
-            errorQueueName = errorQueueName.ToLowerInvariant();
-            
-            // connectionString = CloudConfigurationManager.GetSetting(connectionStringConfigurationName);
             namespaceManager = NamespaceManager.CreateFromConnectionString(connectionString);
 
-            if (!namespaceManager.QueueExists(inputQueueName))
-            {
-                namespaceManager.CreateQueue(inputQueueName);
-            }
-            if (!namespaceManager.QueueExists(errorQueueName))
-            {
-                namespaceManager.CreateQueue(errorQueueName);
-            }
+            InputQueue = inputQueue;
 
-            messagingFactory = MessagingFactory.CreateFromConnectionString(connectionString);
-            receiverQueueClient = QueueClient.CreateFromConnectionString(connectionString, inputQueueName);
-            
-            InputQueue = inputQueueName;
-            ErrorQueue = errorQueueName;
-            InputQueueAddress = inputQueueName;
-        }
-
-        private void EnsureTransactionEvents(ITransactionContext context, string queueSuffix)
-        {
-            if (context.IsTransactional)
+            log.Info("Ensuring that topic '{0}' exists", TopicName);
+            if (!namespaceManager.TopicExists(TopicName))
             {
-                if (context[AzureServiceBusMessageQueueContextKey + queueSuffix] == null)
+                try
                 {
-                    context[AzureServiceBusMessageQueueContextKey + queueSuffix] = true;
-                    context.DoCommit += () =>
-                    {
-                        if (messagesToSend.Value.Count > 0)
-                        {
-                            while (messagesToSend.Value.Count > 0)
-                            {
-                                var destinationAndMessage = messagesToSend.Value.Dequeue();
-                                var client = messagingFactory.CreateQueueClient(destinationAndMessage.Item1);
-                                client.Send(destinationAndMessage.Item2);
-                            }
-
-                        }
-
-                        if (messagesReceived.Value.Count > 0)
-                        {
-                            while (messagesReceived.Value.Count > 0)
-                            {
-                                var message = messagesReceived.Value.Dequeue();
-                                message.Complete();
-
-                            }
-                        }
-
-
-                    };
-                    context.DoRollback += () =>
-                    {
-                        if (messagesReceived.Value.Count > 0)
-                        {
-                            while (messagesReceived.Value.Count > 0)
-                            {
-                                var message = messagesReceived.Value.Dequeue();
-                                message.Abandon();
-
-                            }
-                        }
-                        messagesToSend.Value.Clear();
-
-                    };
-                    context.Cleanup += () =>
-                        {
-                            messagingFactory.Close();
-                            
-                        };
-
+                    namespaceManager.CreateTopic(TopicName);
                 }
-
+                catch
+                {
+                    // just assume the call failed because the topic already exists - if GetTopic below
+                    // fails, then something must be wrong, and then we just want to fail immediately
+                }
             }
 
-        }
-        private TimeSpan? GetTimeToLive(TransportMessageToSend message)
-        {
-            if (message.Headers != null && message.Headers.ContainsKey(Headers.TimeToBeReceived))
-            {
-                return TimeSpan.Parse((string)message.Headers[Headers.TimeToBeReceived]);
-            }
+            topicDescription = namespaceManager.GetTopic(TopicName);
+            GetOrCreateSubscription(InputQueue);
 
-            return null;
+            log.Info("Creating topic client");
+            topicClient = TopicClient.CreateFromConnectionString(connectionString, topicDescription.Path);
+
+            log.Info("Creating subscription client");
+            subscriptionClient = SubscriptionClient.CreateFromConnectionString(connectionString, TopicName, InputQueue);
         }
+
         public void Send(string destinationQueueName, TransportMessageToSend message, ITransactionContext context)
         {
+            var envelope = new Envelope
+                               {
+                                   Body = message.Body,
+                                   Headers = message.Headers != null
+                                                 ? message
+                                                       .Headers
+                                                       .ToDictionary(h => h.Key, h => h.Value.ToString())
+                                                 : null,
+                                   Label = message.Label,
+                               };
 
-            var client = messagingFactory.CreateQueueClient(destinationQueueName);
+            var brokeredMessage = new BrokeredMessage(envelope);
+            brokeredMessage.Properties[LogicalQueuePropertyKey] = destinationQueueName;
 
-            EnsureTransactionEvents(context, "sender");
-
-
-            using (var memoryStream = new MemoryStream())
+            // if we're transactional, and we don't have a transaction scope...
+            if (context.IsTransactional)
             {
-                var formatter = new BinaryFormatter();
-                var receivedTransportMessage = new ReceivedTransportMessage
+                if (Transaction.Current == null)
                 {
-                    Id = Guid.NewGuid().ToString(),
-                    Headers = message.Headers,
-                    Body = message.Body,
-                    Label = message.Label,
-                };
-
-                formatter.Serialize(memoryStream, receivedTransportMessage);
-                memoryStream.Position = 0;
-
-                var brokeredMessage = new BrokeredMessage(memoryStream.ToArray());
-                brokeredMessage.Label = message.Label;
-                brokeredMessage.CorrelationId = receivedTransportMessage.Id;
-
-                var timeToLive = GetTimeToLive(message);
-                if (timeToLive.HasValue)
-                {
-                    brokeredMessage.TimeToLive = timeToLive.Value;
-
+                    var transaction = new TransactionScope();
+                    context.DoCommit += transaction.Complete;
                 }
 
-                if (!context.IsTransactional)
-                {
-                    client.Send(brokeredMessage);
-                }
-                else
-                {
-                    messagesToSend.Value.Enqueue(new Tuple<string, BrokeredMessage>(destinationQueueName, brokeredMessage));
-                }
+                context.Cleanup += brokeredMessage.Dispose;
             }
+
+            // if we're transactional, let the transaction happen and do its thing
+            if (context.IsTransactional)
+            {
+                using (brokeredMessage)
+                {
+                    topicClient.Send(brokeredMessage);
+                }
+                return;
+            }
+
+            var backoffTimes = new[] { 0.1, 0.2, 0.5, 1, 2, 3, 5, 8, 13, 21 }
+                .Select(TimeSpan.FromSeconds)
+                .ToArray();
+
+            new Retrier(backoffTimes)
+                .RetryOn<ServerBusyException>()
+                .RetryOn<MessagingCommunicationException>()
+                .RetryOn<TimeoutException>()
+                .TolerateInnerExceptionsAsWell()
+                .Do(() => topicClient.Send(brokeredMessage));
         }
 
         public ReceivedTransportMessage ReceiveMessage(ITransactionContext context)
         {
-
-
-
-            EnsureTransactionEvents(context, "receiver");
-            BrokeredMessage message = null;
-            if (context.IsTransactional)
+            try
             {
-                var queueClientTransaction = messagingFactory.CreateQueueClient(InputQueue);
-                message = queueClientTransaction.Receive(TimeSpan.FromSeconds(2));
-            }
-            else
-            {
-                message = receiverQueueClient.Receive(TimeSpan.FromSeconds(2));
-            }
+                var brokeredMessage = subscriptionClient.Receive(TimeSpan.FromSeconds(1));
 
+                if (brokeredMessage == null)
+                {
+                    return null;
+                }
 
-            if (message != null)
-            {
                 try
                 {
+                    var envelope = brokeredMessage.GetBody<Envelope>();
 
-
-                    var rawData = message.GetBody<byte[]>();
-
-                    if (rawData == null)
+                    if (context.IsTransactional)
                     {
-                        log.Warn("Received message with NULL data - how weird is that?");
-                        message.Complete();
-                        return null;
+                        context.DoCommit += brokeredMessage.Complete;
+                        context.DoRollback += brokeredMessage.Abandon;
+                    }
+                    else
+                    {
+                        brokeredMessage.Complete();
                     }
 
-                    using (var memoryStream = new MemoryStream(rawData))
-                    {
-                        var formatter = new BinaryFormatter();
-                        var receivedTransportMessage = (ReceivedTransportMessage)formatter.Deserialize(memoryStream);
+                    return new ReceivedTransportMessage
+                               {
+                                   Id = brokeredMessage.MessageId,
+                                   Headers = envelope.Headers == null
+                                                 ? new Dictionary<string, object>()
+                                                 : envelope
+                                                       .Headers
+                                                       .ToDictionary(e => e.Key, e => (object) e.Value),
+                                   Body = envelope.Body,
+                                   Label = envelope.Label
+                               };
+                }
+                catch (Exception receiveException)
+                {
+                    var message = string.Format("An exception occurred while handling brokered message {0}",
+                                                brokeredMessage.MessageId);
 
-                        if (!context.IsTransactional)
+                    try
+                    {
+                        log.Info("Will attempt to abandon message {0}", brokeredMessage.MessageId);
+                        brokeredMessage.Abandon();
+                    }
+                    catch (Exception abandonException)
+                    {
+                        log.Warn("Got exception while abandoning message: {0}", abandonException);
+                    }
+
+                    throw new ApplicationException(message, receiveException);
+                }
+            }
+            catch (Exception e)
+            {
+                log.Warn("Caught exception while receiving message from logical queue '{0}': {1}", InputQueue, e);
+
+                return null;
+            }
+        }
+
+        public string InputQueue { get; private set; }
+
+        public string InputQueueAddress { get { return InputQueue; } }
+
+        public AzureServiceBusMessageQueue Purge()
+        {
+            log.Warn("Purging logical queue {0}", InputQueue);
+
+            namespaceManager.DeleteSubscription(topicDescription.Path, InputQueue);
+            GetOrCreateSubscription(InputQueue);
+
+            return this;
+        }
+
+        [DataContract]
+        class Envelope
+        {
+            [DataMember]
+            public Dictionary<string, string> Headers { get; set; }
+
+            [DataMember]
+            public byte[] Body { get; set; }
+
+            [DataMember]
+            public string Label { get; set; }
+        }
+
+        class Retrier
+        {
+            readonly TimeSpan[] backoffTimes;
+            readonly List<Type> toleratedExceptionTypes = new List<Type>();
+            bool scanInnerExceptions;
+
+            public Retrier(params TimeSpan[] backoffTimes)
+            {
+                this.backoffTimes = backoffTimes;
+            }
+
+            public Retrier TolerateInnerExceptionsAsWell()
+            {
+                scanInnerExceptions = true;
+                return this;
+            }
+
+            public Retrier RetryOn<TException>() where TException : Exception
+            {
+                toleratedExceptionTypes.Add(typeof(TException));
+                return this;
+            }
+
+            public void Do(Action action)
+            {
+                var backoffIndex = 0;
+                var complete = false;
+                var caughtExceptions = new List<Timed<Exception>>();
+
+                while (!complete)
+                {
+                    try
+                    {
+                        action();
+                        complete = true;
+                    }
+                    catch (Exception e)
+                    {
+                        caughtExceptions.Add(e.At(DateTime.Now));
+
+                        if (backoffIndex >= backoffTimes.Length)
                         {
-                            message.Complete();
+                            throw;
+                        }
+
+                        if (ExceptionCanBeTolerated(e))
+                        {
+                            Thread.Sleep(backoffTimes[backoffIndex++]);
                         }
                         else
                         {
-                            messagesReceived.Value.Enqueue(message);
+                            throw new AggregateException(string.Format("Operation did not complete within {0} retries which resulted in exceptions at the following times: {1}",
+                                backoffTimes.Length, string.Join(", ", caughtExceptions.Select(c => c.Time))), caughtExceptions.Select(c => c.Value));
                         }
-                        return receivedTransportMessage;
                     }
+                }
+            }
+
+            bool ExceptionCanBeTolerated(Exception exceptionToCheck)
+            {
+                while (exceptionToCheck != null)
+                {
+                    var exceptionType = exceptionToCheck.GetType();
+
+                    // if the exception can be tolerated...
+                    if (toleratedExceptionTypes.Contains(exceptionType))
+                    {
+                        return true;
+                    }
+
+                    // otherwise, see if we are allowed to check the inner exception as well
+                    exceptionToCheck = scanInnerExceptions 
+                        ? exceptionToCheck.InnerException 
+                        : null;
+                }
+                
+                // exception cannot be tolerated
+                return false;
+            }
+        }
+
+        void GetOrCreateSubscription(string logicalQueueName)
+        {
+            if (namespaceManager.SubscriptionExists(topicDescription.Path, logicalQueueName)) return;
+
+            try
+            {
+                log.Info("Establishing subscription '{0}'", logicalQueueName);
+                var filter = new SqlFilter(string.Format("LogicalDestinationQueue = '{0}'", logicalQueueName));
+                namespaceManager.CreateSubscription(topicDescription.Path, logicalQueueName, filter);
+            }
+            catch (MessagingEntityAlreadyExistsException)
+            {
+            }
+        }
+
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        protected virtual void Dispose(bool disposing)
+        {
+            if (disposed) return;
+
+            if (disposing)
+            {
+                try
+                {
+                    log.Info("Closing subscription client");
+                    subscriptionClient.Close();
                 }
                 catch (Exception e)
                 {
-                    log.Error(e, "An error occurred while receiving message from {0}", InputQueue);
-                    if (!context.IsTransactional)
-                    {
-                        message.Abandon();
-                    }
+                    log.Warn("An exception occurred while closing the subscription client: {0}", e);
+                }
 
-                    return null;
+                try
+                {
+                    log.Info("Closing topic client");
+                    topicClient.Close();
+                }
+                catch (Exception e)
+                {
+                    log.Warn("An exception occurred while closing the topic client: {0}", e);
                 }
             }
-            return null;
-        }
 
-
-
-        public string InputQueue { get; private set; }
-        public string InputQueueAddress { get; private set; }
-        public string ErrorQueue { get; private set; }
-
-        public AzureServiceBusMessageQueue ResetQueue()
-        {
-            namespaceManager.DeleteQueue(InputQueue);
-            namespaceManager.CreateQueue(InputQueue);
-
-            return this;
+            disposed = true;
         }
     }
 }

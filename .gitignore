@@ -4,6 +4,7 @@ deploy
 deploy/*
 packages
 packages/*
+_NCrunch_*/*
 _ReSharper.*
 _NCrunch_*
 *.ncrunchproject
@@ -21,3 +22,5 @@ _NCrunch_*
 *.suo
 *.cache
 ~$*
+
+src/Rebus.Tests/azure_connection_string.txt

@@ -119,5 +119,31 @@ namespace Rebus.Snoop.ViewModel.Models
             get { return couldDeserializeHeaders; }
             set { SetValue(() => CouldDeserializeHeaders, value); }
         }
+
+        public string ReturnAddress
+        {
+            get
+            {
+                return Headers.ContainsKey(Shared.Headers.ReturnAddress)
+                           ? Headers[Shared.Headers.ReturnAddress]
+                           : "";
+            }
+        }
+
+        public Message Clone()
+        {
+            return new Message
+                       {
+                           Headers = Headers.Clone(),
+                           Body = Body,
+                           Bytes = Bytes,
+                           Id = "(reload queue contents to get id)",
+                           CouldDeserializeBody = CouldDeserializeBody,
+                           CouldDeserializeHeaders = CouldDeserializeHeaders,
+                           QueuePath = QueuePath,
+                           Label = Label,
+                           Time = Time,
+                       };
+        }
     }
 }
