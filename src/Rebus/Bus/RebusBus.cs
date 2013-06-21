@@ -37,6 +37,7 @@ namespace Rebus.Bus
         readonly List<Worker> workers = new List<Worker>();
         readonly IErrorTracker errorTracker;
         readonly IStoreTimeouts storeTimeouts;
+        readonly ConfigureAdditionalBehavior configureAdditionalBehavior;
         readonly HeaderContext headerContext = new HeaderContext();
         readonly RebusEvents events = new RebusEvents();
         readonly RebusBatchOperations batch;
@@ -61,7 +62,9 @@ namespace Rebus.Bus
         /// <param name="serializeMessages">Will be used to serialize and deserialize transport messages.</param>
         /// <param name="inspectHandlerPipeline">Will be called to inspect the pipeline of handlers constructed to handle an incoming message.</param>
         /// <param name="errorTracker">Will be used to track failed delivery attempts.</param>
-        public RebusBus(IActivateHandlers activateHandlers, ISendMessages sendMessages, IReceiveMessages receiveMessages, IStoreSubscriptions storeSubscriptions, IStoreSagaData storeSagaData, IDetermineMessageOwnership determineMessageOwnership, ISerializeMessages serializeMessages, IInspectHandlerPipeline inspectHandlerPipeline, IErrorTracker errorTracker, IStoreTimeouts storeTimeouts)
+        /// <param name="storeTimeouts">Optionally provides an internal timeout manager to be used instead of sending timeout requests to an external timeout manager</param>
+        /// <param name="configureAdditionalBehavior"></param>
+        public RebusBus(IActivateHandlers activateHandlers, ISendMessages sendMessages, IReceiveMessages receiveMessages, IStoreSubscriptions storeSubscriptions, IStoreSagaData storeSagaData, IDetermineMessageOwnership determineMessageOwnership, ISerializeMessages serializeMessages, IInspectHandlerPipeline inspectHandlerPipeline, IErrorTracker errorTracker, IStoreTimeouts storeTimeouts, ConfigureAdditionalBehavior configureAdditionalBehavior)
         {
             this.activateHandlers = activateHandlers;
             this.sendMessages = sendMessages;
@@ -73,13 +76,14 @@ namespace Rebus.Bus
             this.inspectHandlerPipeline = inspectHandlerPipeline;
             this.errorTracker = errorTracker;
             this.storeTimeouts = storeTimeouts;
+            this.configureAdditionalBehavior = configureAdditionalBehavior;
 
             batch = new RebusBatchOperations(determineMessageOwnership, storeSubscriptions, this);
             routing = new RebusRouting(this);
 
             rebusId = Interlocked.Increment(ref rebusIdCounter);
 
-            log.Info("Rebus bus created");
+            log.Info("Rebus bus {0} created", rebusId);
 
             if (storeTimeouts == null)
             {
@@ -95,6 +99,22 @@ namespace Rebus.Bus
                 timeoutManagerAddress = this.receiveMessages.InputQueue;
                 dueTimeoutScheduler = new DueTimeoutScheduler(storeTimeouts, new DeferredMessageReDispatcher(this));
             }
+        }
+
+        IEnumerable<object> InjectedServices()
+        {
+            return new object[]
+                       {
+                           activateHandlers,
+                           headerContext, sendMessages, receiveMessages,
+                           storeSubscriptions, storeSagaData,
+                           dueTimeoutScheduler, determineMessageOwnership,
+                           serializeMessages,
+                           inspectHandlerPipeline,
+                           errorTracker,
+                           storeTimeouts
+                       }
+                .Where(r => !ReferenceEquals(null, r));
         }
 
         /// <summary>
@@ -315,7 +335,7 @@ namespace Rebus.Bus
             }
 
             var messages = new List<object> { timeoutRequest };
-            
+
             InternalSend(timeoutManagerAddress, messages);
         }
 
@@ -377,12 +397,23 @@ Not that it actually matters, I mean we _could_ just ignore subsequent calls to 
                 busMode = BusMode.OneWayClientMode;
             }
 
+            InitializeServicesThatMustBeInitialized();
+
             log.Info("Initializing bus with {0} workers", numberOfWorkers);
 
             SetNumberOfWorkers(numberOfWorkers);
             started = true;
 
             log.Info("Bus started");
+        }
+
+        void InitializeServicesThatMustBeInitialized()
+        {
+            foreach (var mustBeInitialized in InjectedServices().OfType<INeedInitializationBeforeStart>())
+            {
+                log.Info("Initializing {0}", mustBeInitialized.GetType());
+                mustBeInitialized.Initialize();
+            }
         }
 
         internal void InternalReply(List<object> messages)
@@ -441,9 +472,9 @@ Not that it actually matters, I mean we _could_ just ignore subsequent calls to 
 Or actually, you _could_ - but it would most likely be an error if you were
 using a bus without starting it... if you mean only to SEND messages, never
 RECEIVE anything, then you're not looking for an unstarted bus, you're looking
-for the ONE-WAY CLIENT MODE of the bus, which is what you automatically get if
+for the ONE-WAY CLIENT MODE of the bus, which is what you get if
 you omit the inputQueue, errorQueue and workers attributes of the Rebus XML
-element)"));
+element and use e.g. .Transport(t => t.UseMsmqInOneWayClientMode())"));
             }
 
             messages.ForEach(m => events.RaiseMessageSent(this, destination, m));
@@ -577,13 +608,8 @@ element)"));
 
             SetNumberOfWorkers(0);
 
-            var disposables = new object[]
-                {
-                    headerContext, sendMessages, receiveMessages,
-                    storeSubscriptions, storeSagaData,
-                    dueTimeoutScheduler
-                }
-                .Where(r => !ReferenceEquals(null, r))
+            var disposables = InjectedServices()
+                .Except(new object[] {activateHandlers})
                 .OfType<IDisposable>()
                 .Distinct();
 
@@ -612,7 +638,9 @@ element)"));
                                         string.Format("Rebus {0} worker {1}", rebusId, workers.Count + 1),
                                         new DeferredMessageReDispatcher(this),
                                         new IncomingMessageMutatorPipeline(Events),
-                                        storeTimeouts);
+                                        storeTimeouts,
+                                        events.UnitOfWorkManagers,
+                                        configureAdditionalBehavior);
                 workers.Add(worker);
                 worker.MessageFailedMaxNumberOfTimes += HandleMessageFailedMaxNumberOfTimes;
                 worker.UserException += LogUserException;

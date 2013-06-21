@@ -8,7 +8,6 @@ using Rebus.Persistence.InMemory;
 using Rebus.Serialization.Json;
 using Rebus.Shared;
 using Rebus.Tests.Integration;
-using Rebus.Timeout;
 using Rebus.Transports.Msmq;
 using log4net.Config;
 
@@ -76,7 +75,8 @@ namespace Rebus.Tests
                                    storeSubscriptions, storeSagaData,
                                    this, serializer, pipelineInspector,
                                    new ErrorTracker(errorQueueName),
-                                   null);
+                                   null,
+                                   new ConfigureAdditionalBehavior());
             
             EnsureProperDisposal(bus);
             EnsureProperDisposal(messageQueue);

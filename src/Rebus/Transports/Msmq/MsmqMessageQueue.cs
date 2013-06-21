@@ -41,7 +41,7 @@ namespace Rebus.Transports.Msmq
         /// Constructs the <see cref="MsmqMessageQueue"/>, using the specified input queue. If the queue does not exist,
         /// it will attempt to create it. If it already exists, it will assert that the queue is transactional.
         /// </summary>
-        public MsmqMessageQueue(string inputQueueName)
+        public MsmqMessageQueue(string inputQueueName, bool allowRemoteQueue = false)
         {
             if (inputQueueName == null) return;
 
@@ -52,7 +52,11 @@ namespace Rebus.Transports.Msmq
                 inputQueuePath = MsmqUtil.GetPath(inputQueueName);
                 MsmqUtil.EnsureMessageQueueExists(inputQueuePath);
                 MsmqUtil.EnsureMessageQueueIsTransactional(inputQueuePath);
-                EnsureMessageQueueIsLocal(inputQueueName);
+                
+                if (!allowRemoteQueue)
+                {
+                    EnsureMessageQueueIsLocal(inputQueueName);
+                }
 
                 inputQueue = GetMessageQueue(inputQueuePath);
 
@@ -91,7 +95,12 @@ because there would be remote calls involved when you wanted to receive a messag
         /// </summary>
         public string InputQueueAddress
         {
-            get { return InputQueue + "@" + machineAddress; }
+            get
+            {
+                return !InputQueue.Contains("@")
+                           ? InputQueue + "@" + machineAddress
+                           : InputQueue;
+            }
         }
 
         /// <summary>
@@ -171,21 +180,29 @@ because there would be remote calls involved when you wanted to receive a messag
         {
             var recipientPath = MsmqUtil.GetSenderPath(destinationQueueName);
 
-            if (!context.IsTransactional)
+            try
             {
-                using (var outputQueue = GetMessageQueue(recipientPath))
-                using (var transaction = new MessageQueueTransaction())
+                if (!context.IsTransactional)
                 {
-                    transaction.Begin();
-                    outputQueue.Send(message, transaction);
-                    transaction.Commit();
+                    using (var outputQueue = GetMessageQueue(recipientPath))
+                    using (var transaction = new MessageQueueTransaction())
+                    {
+                        transaction.Begin();
+                        outputQueue.Send(message, transaction);
+                        transaction.Commit();
+                    }
+                    return;
                 }
-                return;
-            }
 
-            using (var outputQueue = GetMessageQueue(recipientPath))
+                using (var outputQueue = GetMessageQueue(recipientPath))
+                {
+                    outputQueue.Send(message, GetTransaction(context));
+                }
+            }
+            catch (Exception e)
             {
-                outputQueue.Send(message, GetTransaction(context));
+                throw new ApplicationException(string.Format("An error occurred while attempting to send {0} to {1}",
+                                                             message, destinationQueueName), e);
             }
         }
 

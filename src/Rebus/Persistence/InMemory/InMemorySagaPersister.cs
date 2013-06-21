@@ -10,7 +10,9 @@ namespace Rebus.Persistence.InMemory
 {
     /// <summary>
     /// Saga persister that stores saga data in memory. Should probably not be used for anything real, except in scenarios
-    /// where you know the sagas are very short-lived and don't have to be durable.
+    /// where you know the sagas are very short-lived and don't have to be durable. Saga instances are cloned each time they
+    /// are used, so the persister will emulate the workings of durable saga persisters in a fairly realistic manner when used
+    /// concurrently.
     /// </summary>
     public class InMemorySagaPersister : IStoreSagaData, IEnumerable<ISagaData>
     {
@@ -178,7 +180,7 @@ namespace Rebus.Persistence.InMemory
         /// </summary>
         public IEnumerator<ISagaData> GetEnumerator()
         {
-            return dataByType.Values.SelectMany(v => v.Values).ToList().GetEnumerator();
+            return dataByType.Values.SelectMany(v => v.Values).GetEnumerator();
         }
 
         IEnumerator IEnumerable.GetEnumerator()

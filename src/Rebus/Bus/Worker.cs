@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Reflection;
 using System.Threading;
 using System.Transactions;
+using Rebus.Configuration;
 using Rebus.Logging;
 using System.Linq;
 using Rebus.Timeout;
@@ -32,6 +34,8 @@ namespace Rebus.Bus
         readonly IReceiveMessages receiveMessages;
         readonly ISerializeMessages serializeMessages;
         readonly IMutateIncomingMessages mutateIncomingMessages;
+        readonly IEnumerable<IUnitOfWorkManager> unitOfWorkManagers;
+        readonly ConfigureAdditionalBehavior configureAdditionalBehavior;
 
         internal event Action<ReceivedTransportMessage> BeforeTransportMessage = delegate { };
 
@@ -45,7 +49,7 @@ namespace Rebus.Bus
 
         internal event Action<object, Saga> UncorrelatedMessage = delegate { };
 
-        internal event Action<IMessageContext> MessageContextEstablished = delegate { }; 
+        internal event Action<IMessageContext> MessageContextEstablished = delegate { };
 
         volatile bool shouldExit;
         volatile bool shouldWork;
@@ -60,11 +64,15 @@ namespace Rebus.Bus
             string workerThreadName,
             IHandleDeferredMessage handleDeferredMessage,
             IMutateIncomingMessages mutateIncomingMessages,
-            IStoreTimeouts storeTimeouts)
+            IStoreTimeouts storeTimeouts,
+            IEnumerable<IUnitOfWorkManager> unitOfWorkManagers,
+            ConfigureAdditionalBehavior configureAdditionalBehavior)
         {
             this.receiveMessages = receiveMessages;
             this.serializeMessages = serializeMessages;
             this.mutateIncomingMessages = mutateIncomingMessages;
+            this.unitOfWorkManagers = unitOfWorkManagers;
+            this.configureAdditionalBehavior = configureAdditionalBehavior;
             this.errorTracker = errorTracker;
             dispatcher = new Dispatcher(storeSagaData, activateHandlers, storeSubscriptions, inspectHandlerPipeline, handleDeferredMessage, storeTimeouts);
             dispatcher.UncorrelatedMessage += RaiseUncorrelatedMessage;
@@ -155,18 +163,29 @@ namespace Rebus.Bus
                 }
                 catch (Exception e)
                 {
-                    // if there's two levels of TargetInvocationExceptions, it's user code that threw...
-                    if (e is TargetInvocationException && e.InnerException is TargetInvocationException)
+                    try
                     {
-                        UserException(this, e.InnerException.InnerException);
+                        // if there's two levels of TargetInvocationExceptions, it's user code that threw...
+                        if (e is TargetInvocationException && e.InnerException is TargetInvocationException)
+                        {
+                            UserException(this, e.InnerException.InnerException);
+                        }
+                        else if (e is TargetInvocationException)
+                        {
+                            UserException(this, e.InnerException);
+                        }
+                        else
+                        {
+                            SystemException(this, e);
+                        }
                     }
-                    else if (e is TargetInvocationException)
+                    catch (Exception ex)
                     {
-                        UserException(this, e.InnerException);
-                    }
-                    else
-                    {
-                        SystemException(this, e);
+                        log.Error(ex, "An exception occurred while raising an error event! There's nothing we can do about" +
+                                     " it at this point, except kick back and wait for a while, because we probably don't" +
+                                     " want to spam the logs - so we'll sleep for a second before carrying on...");
+
+                        Thread.Sleep(TimeSpan.FromSeconds(1));
                     }
                 }
             }
@@ -246,54 +265,93 @@ namespace Rebus.Bus
                     context = MessageContext.Establish(message.Headers);
                     MessageContextEstablished(context);
 
-                    foreach (var logicalMessage in message.Messages.Select(MutateIncoming))
+                    var unitsOfWork = unitOfWorkManagers.Select(u => u.Create())
+                                    .Where(u => !ReferenceEquals(null, u))
+                                    .ToArray(); //< remember to invoke the chain here :)
+
+                    try
                     {
-                        context.SetLogicalMessage(logicalMessage);
-
-                        Exception logicalMessageExceptionOrNull = null;
-                        try
+                        foreach (var logicalMessage in message.Messages.Select(MutateIncoming))
                         {
-                            BeforeMessage(logicalMessage);
+                            context.SetLogicalMessage(logicalMessage);
 
-                            var typeToDispatch = logicalMessage.GetType();
+                            Exception logicalMessageExceptionOrNull = null;
+                            try
+                            {
+                                BeforeMessage(logicalMessage);
 
-                            log.Debug("Dispatching message {0}: {1}", id, typeToDispatch);
+                                var typeToDispatch = logicalMessage.GetType();
 
-                            GetDispatchMethod(typeToDispatch).Invoke(this, new[] { logicalMessage });
+                                log.Debug("Dispatching message {0}: {1}", id, typeToDispatch);
+
+                                GetDispatchMethod(typeToDispatch)
+                                    .Invoke(this, new[] {logicalMessage});
+                            }
+                            catch (Exception exception)
+                            {
+                                logicalMessageExceptionOrNull = exception;
+                                throw;
+                            }
+                            finally
+                            {
+                                try
+                                {
+                                    AfterMessage(logicalMessageExceptionOrNull, logicalMessage);
+                                }
+                                catch (Exception exceptionWhileRaisingEvent)
+                                {
+                                    if (logicalMessageExceptionOrNull != null)
+                                    {
+                                        log.Error(
+                                            "An exception occurred while raising the AfterMessage event, and an exception occurred some" +
+                                            " time before that as well. The first exception was this: {0}. And then, when raising the" +
+                                            " AfterMessage event (including the details of the first error), this exception occurred: {1}",
+                                            logicalMessageExceptionOrNull, exceptionWhileRaisingEvent);
+                                    }
+                                    else
+                                    {
+                                        log.Error("An exception occurred while raising the AfterMessage event: {0}",
+                                                  exceptionWhileRaisingEvent);
+                                    }
+                                }
+
+                                context.ClearLogicalMessage();
+                            }
                         }
-                        catch (Exception exception)
+
+                        foreach (var unitOfWork in unitsOfWork)
                         {
-                            logicalMessageExceptionOrNull = exception;
-                            throw;
+                            unitOfWork.Commit();
                         }
-                        finally
+                    }
+                    catch
+                    {
+                        foreach (var unitOfWork in unitsOfWork)
                         {
                             try
                             {
-                                AfterMessage(logicalMessageExceptionOrNull, logicalMessage);
+                                unitOfWork.Abort();
                             }
-                            catch (Exception exceptionWhileRaisingEvent)
+                            catch (Exception abortException)
                             {
-                                if (logicalMessageExceptionOrNull != null)
-                                {
-                                    log.Error(
-                                        "An exception occurred while raising the AfterMessage event, and an exception occurred some" +
-                                        " time before that as well. The first exception was this: {0}. And then, when raising the" +
-                                        " AfterMessage event (including the details of the first error), this exception occurred: {1}",
-                                        logicalMessageExceptionOrNull, exceptionWhileRaisingEvent);
-                                }
-                                else
-                                {
-                                    log.Error("An exception occurred while raising the AfterMessage event: {0}",
-                                              exceptionWhileRaisingEvent);
-                                }
+                                log.Warn("An error occurred while aborting the unit of work {0}: {1}",
+                                         unitOfWork, abortException);
                             }
-
-                            context.ClearLogicalMessage();
+                        }
+                        throw;
+                    }
+                    finally
+                    {
+                        foreach (var unitOfWork in unitsOfWork)
+                        {
+                            unitOfWork.Dispose();
                         }
                     }
 
-                    scope.Complete();
+                    if (scope != null)
+                    {
+                        scope.Complete();
+                    }
                 }
             }
             catch (Exception exception)
@@ -338,8 +396,8 @@ namespace Rebus.Bus
 
         void HandlePoisonMessage(string id, ReceivedTransportMessage transportMessage)
         {
-            log.Error("Handling message {0} has failed the maximum number of times", id);
             var errorText = errorTracker.GetErrorText(id);
+            log.Error("Handling message {0} has failed the maximum number of times - details: {1}", id, errorText);
             var poisonMessageInfo = errorTracker.GetPoisonMessageInfo(id);
 
             MessageFailedMaxNumberOfTimes(transportMessage, errorText);
@@ -358,6 +416,11 @@ namespace Rebus.Bus
 
         TransactionScope BeginTransaction()
         {
+            if (!configureAdditionalBehavior.HandleMessagesInTransactionScope)
+            {
+                return null;
+            }
+
             var transactionOptions = new TransactionOptions
             {
                 IsolationLevel = IsolationLevel.ReadCommitted,
